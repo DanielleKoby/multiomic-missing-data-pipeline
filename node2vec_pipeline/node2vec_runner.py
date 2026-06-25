@@ -7,8 +7,21 @@ everything around it: hyperparameter-grid planning, persistence, the grid driver
 and the CLI.
 
 Takes the graph built by ``graph_assembly.py`` and runs node2vec under a grid of
-hyperparameters, saving one embedding table per configuration with a
-self-describing filename, e.g.:: embeddings_p1.0_q0.5_d128_l80_nw10.csv
+hyperparameters. Each configuration is written to its own **self-describing
+folder** under ``out_dir``::
+
+    embeddings/
+        manifest.csv                          # cross-run index (all versions/configs)
+        v1_p1.0_q1.0_d128_l80_nw10/           # one run: v<mapping_version>_<params>
+            embeddings_p1.0_q1.0_d128_l80_nw10.csv
+            embeddings_p1.0_q1.0_d128_l80_nw10.npy
+            embeddings_p1.0_q1.0_d128_l80_nw10.vocab.json
+            README.md                         # copied in, so the folder is self-contained
+
+The leading ``v<n>`` is the **metabolite -> KEGG mapping version** (bump it when
+the metabolome.csv -> KEGG matching improves); it is independent of the node2vec
+hyperparameters. ``manifest.csv`` stays at the top level and is NOT copied into
+the per-run folders.
 
 Embedding output format (Transformer-ready)
 -------------------------------------------
@@ -29,6 +42,7 @@ from __future__ import annotations
 
 import os
 import json
+import shutil
 import itertools
 from dataclasses import dataclass, asdict
 from typing import Iterable
@@ -79,13 +93,25 @@ def build_param_grid(
 # ===========================================================================
 # 2. Persistence (CSV + .npy + vocab.json)
 # ---------------------------------------------------------------------------
+def run_dir_name(params: N2VParams, version: str) -> str:
+    """Self-describing folder name for one run: ``v<version>_<param-stub>``.
+
+    The ``v<version>`` prefix records the metabolite -> KEGG mapping version, so
+    re-running after the mapping improves lands in a *new* folder rather than
+    overwriting the old one.
+    """
+    return f"v{version}_{params.filename_stub()}"
+
+
 def save_embeddings(
     df: pd.DataFrame,
     params: N2VParams,
     out_dir: str,
+    version: str = "1",
 ) -> dict:
     """
-    Save one configuration's embeddings in three Transformer-friendly forms:
+    Save one configuration's embeddings into its own ``v<version>_<stub>/`` folder
+    under ``out_dir``, in three Transformer-friendly forms:
 
       * ``embeddings_<stub>.csv``  : human-readable lookup table (index = node id)
       * ``embeddings_<stub>.npy``  : float32 [N, d] matrix for fast tensor load
@@ -96,13 +122,18 @@ def save_embeddings(
         mat = np.load("embeddings_<stub>.npy")
         vocab = json.load(open("embeddings_<stub>.vocab.json"))
         mat[vocab["microbe::Agathobacter rectalis"]]   # that node's vector
+
+    If a canonical ``README.md`` exists at ``out_dir`` it is copied into the run
+    folder so each folder is a self-contained handoff. The cross-run
+    ``manifest.csv`` is written by the caller and is NOT placed here.
     """
-    os.makedirs(out_dir, exist_ok=True)
+    run_dir = os.path.join(out_dir, run_dir_name(params, version))
+    os.makedirs(run_dir, exist_ok=True)
     stub = params.filename_stub()
 
-    csv_path = os.path.join(out_dir, f"embeddings_{stub}.csv")
-    npy_path = os.path.join(out_dir, f"embeddings_{stub}.npy")
-    vocab_path = os.path.join(out_dir, f"embeddings_{stub}.vocab.json")
+    csv_path = os.path.join(run_dir, f"embeddings_{stub}.csv")
+    npy_path = os.path.join(run_dir, f"embeddings_{stub}.npy")
+    vocab_path = os.path.join(run_dir, f"embeddings_{stub}.vocab.json")
 
     # CSV (includes node_type column).
     df.to_csv(csv_path)
@@ -114,7 +145,13 @@ def save_embeddings(
     with open(vocab_path, "w") as fh:
         json.dump(vocab, fh)
 
-    return {"csv": csv_path, "npy": npy_path, "vocab": vocab_path}
+    # Copy the handoff README in, so the folder stands alone.
+    readme_src = os.path.join(out_dir, "README.md")
+    readme_path = os.path.join(run_dir, "README.md") if os.path.exists(readme_src) else None
+    if readme_path is not None:
+        shutil.copy2(readme_src, readme_path)
+
+    return {"csv": csv_path, "npy": npy_path, "vocab": vocab_path, "readme": readme_path}
 
 
 # ===========================================================================
@@ -125,6 +162,7 @@ def run_grid(
     grid: list[N2VParams],
     out_dir: str = "embeddings",
     *,
+    version: str = "1",
     weight_key: str = "weight",
     workers: int = 1,
     window: int = 10,
@@ -135,10 +173,13 @@ def run_grid(
     Run every configuration in ``grid`` and persist results.
 
     Each config runs node2vec independently via ``run_node2vec`` (biased-walk
-    precompute + sampling + skip-gram fit), then its embedding table is saved.
+    precompute + sampling + skip-gram fit), then its embedding table is saved
+    into its own ``v<version>_<stub>/`` folder. ``version`` is the metabolite ->
+    KEGG mapping version (folder-name prefix), independent of the hyperparameters.
 
-    Returns a manifest DataFrame (one row per run) recording the params and the
-    output paths — handy for later selecting which embedding to load.
+    Returns a manifest DataFrame (one row per run) recording the version, params
+    and output paths — handy for later selecting which embedding to load. The
+    manifest is written once at ``out_dir`` (top level), not inside the folders.
     """
     manifest_rows = []
     for params in grid:
@@ -155,9 +196,9 @@ def run_grid(
             min_count=min_count,
             seed=seed,
         )
-        paths = save_embeddings(df, params, out_dir)
-        manifest_rows.append({**asdict(params), **paths})
-        print(f"{params.filename_stub()} -> {paths['csv']}")
+        paths = save_embeddings(df, params, out_dir, version=version)
+        manifest_rows.append({"v": version, **asdict(params), **paths})
+        print(f"{run_dir_name(params, version)} -> {paths['csv']}")
 
     manifest = pd.DataFrame(manifest_rows)
     os.makedirs(out_dir, exist_ok=True)
@@ -184,6 +225,9 @@ if __name__ == "__main__":
                    help="Path to a prebuilt .graphml; if omitted, the graph is built from raw data.")
     p.add_argument("--out_dir", default=os.path.join(processed, "embeddings"))
     p.add_argument("--workers", type=int, default=1)
+    # Metabolite -> KEGG mapping version; prefixes each run folder (v<n>_...).
+    # Bump it when you improve the metabolome.csv -> KEGG matching.
+    p.add_argument("--v", default="1")
     # Hyperparameter axes (comma-separated lists). Defaults = common-practice
     # single values (node2vec paper: p=q=1 unbiased walk, d=128, l=80, nw=10).
     p.add_argument("--p", default="1.0")
@@ -212,4 +256,4 @@ if __name__ == "__main__":
         l_values=axis(args.l, int),
         num_walks_values=axis(args.num_walks, int),
     )
-    run_grid(G, grid, out_dir=args.out_dir, workers=args.workers)
+    run_grid(G, grid, out_dir=args.out_dir, version=args.v, workers=args.workers)
