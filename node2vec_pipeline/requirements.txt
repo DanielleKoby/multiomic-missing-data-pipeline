@@ -1,0 +1,11 @@
+# ---------------------------------------------------------------------------
+# Dependencies for the node2vec multi-omic embedding pipeline
+# Install with:  pip install -r requirements.txt
+# ---------------------------------------------------------------------------
+networkx>=3.0        # graph data structure (Graph / DiGraph)
+pandas>=1.5          # tabular I/O and preprocessing
+numpy>=1.23          # numerical arrays / .npy export
+scikit-learn>=1.2    # MinMax / Standard scalers for edge-weight normalization
+gensim>=4.3          # Word2Vec backend used by node2vec
+node2vec>=0.4.6      # reference node2vec implementation (Grover & Leskovec, KDD'16)
+biopython>=1.80      # KEGG COMPOUND flat-file parser + REST name lookup (metabolite mapping)
